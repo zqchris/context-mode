@@ -79,7 +79,7 @@ describe("Pi package manifest", () => {
       pi?: { extensions?: unknown; skills?: unknown };
     };
 
-    expect(pkg.pi?.extensions).toContain("./.pi/extensions/context-mode/extension.mjs");
+    expect(pkg.pi?.extensions).toContain("./.pi/extensions/context-mode/index.ts");
     expect(pkg.pi?.skills).toEqual([]);
   });
 
