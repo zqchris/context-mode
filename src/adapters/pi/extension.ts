@@ -12,7 +12,7 @@
  */
 
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, readdirSync, statSync } from "node:fs";
+import { existsSync, mkdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve, dirname } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -63,132 +63,6 @@ const BLOCKED_HTTP_PATTERNS: RegExp[] = [
   /\burllib\.request/,
   /\bInvoke-WebRequest\b/,
 ];
-
-// Native Pi `read` always remains available because the extension cannot know
-// whether a file is required verbatim (for example, instructions or source to
-// edit). Routing is limited to operations whose large-output shape can be
-// identified before execution: unbounded searches, directory trees, and shell
-// commands that are likely to dump substantial output.
-export const PI_INLINE_COMMAND_MAX_LINES = 200;
-export const PI_INLINE_SEARCH_MAX_RESULTS = 100;
-export const PI_INLINE_LS_MAX_ENTRIES = 100;
-
-const ROUTING_REASON =
-  "Use context-mode for large inspection output: " +
-  "ctx_execute or ctx_batch_execute for repository searches and commands. " +
-  "Keep native calls bounded when the result is genuinely small.";
-
-function numericInput(input: Record<string, unknown>, ...keys: string[]): number | undefined {
-  for (const key of keys) {
-    const value = input[key];
-    if (typeof value === "number" && Number.isFinite(value)) return value;
-    if (typeof value === "string" && value.trim() !== "") {
-      const parsed = Number(value);
-      if (Number.isFinite(parsed)) return parsed;
-    }
-  }
-  return undefined;
-}
-
-function toolPath(input: Record<string, unknown>): string | undefined {
-  const value = input.path ?? input.file_path ?? input.filePath;
-  return typeof value === "string" && value.length > 0 ? value : undefined;
-}
-
-function resolvedToolPath(input: Record<string, unknown>, cwd: string): string | undefined {
-  const path = toolPath(input);
-  return path ? resolve(cwd, path) : undefined;
-}
-
-function directoryIsLarge(path: string | undefined): boolean {
-  if (!path) return false;
-  try {
-    if (!statSync(path).isDirectory()) return false;
-    return readdirSync(path, { withFileTypes: true }).length > PI_INLINE_LS_MAX_ENTRIES;
-  } catch {
-    return false;
-  }
-}
-
-/** True when a native grep/find call has no useful output bound. */
-export function shouldRoutePiSearch(input: Record<string, unknown>): boolean {
-  const limit = numericInput(input, "limit", "maxResults", "max_results");
-  return limit === undefined || limit <= 0 || limit > PI_INLINE_SEARCH_MAX_RESULTS;
-}
-
-/** True when a native `ls` call can enumerate a large tree/directory. */
-export function shouldRoutePiLs(
-  input: Record<string, unknown>,
-  cwd = process.cwd(),
-): boolean {
-  const depth = numericInput(input, "depth");
-  if (depth !== undefined && depth > 1) return true;
-  return directoryIsLarge(resolvedToolPath(input, cwd) ?? cwd);
-}
-
-function hasSmallLineBound(command: string): boolean {
-  const sedRange = command.match(/-n\s+['"]?\d+\s*,\s*(\d+)/i)?.[1];
-  const numeric = sedRange ?? command.match(/(?:-n|--lines(?:=|\s+)|-\s*)\s*['"]?(\d+)/i)?.[1];
-  return numeric !== undefined && Number(numeric) <= PI_INLINE_COMMAND_MAX_LINES;
-}
-
-/** True when a bash command is a likely unbounded repository/file dump. */
-export function shouldRoutePiBash(command: string): boolean {
-  const originalSegments = command.split(/\s*(?:&&|\|\||;)\s*/);
-  const strippedSegments = originalSegments.map(stripQuotedContent);
-  return strippedSegments.some((segment, index) => {
-    const s = segment.trim();
-    const original = originalSegments[index]?.trim() ?? s;
-    if (!s) return false;
-
-    if (/\b(?:cat|rg|grep|find|tree)\b/i.test(s)) return true;
-    if (/\b(?:head|tail|sed)\b/i.test(s) && !hasSmallLineBound(original)) return true;
-
-    if (/\bgit\s+diff\b/i.test(s)) {
-      return !/\s(?:--stat|--shortstat|--numstat|--name-only|--name-status)\b/i.test(s);
-    }
-    if (/\bgit\s+(?:show|log)\b/i.test(s)) {
-      const boundedCommitList = /\b(?:-1|--max-count(?:=|\s+)\d+|-n\s*\d+)\b/i.test(s);
-      const summaryOnly = /\s(?:--stat|--shortstat|--name-only|--name-status|--oneline)\b/i.test(s);
-      return !(boundedCommitList && summaryOnly);
-    }
-    return false;
-  });
-}
-
-export interface PiToolRoutingOptions {
-  contextModeAvailable: boolean;
-  cwd?: string;
-}
-
-/**
- * Decide whether a Pi native tool call should be redirected to context-mode.
- * This is intentionally pure apart from bounded filesystem metadata checks so
- * it can be tested without starting Pi or the MCP bridge.
- */
-export function routePiToolCall(
-  event: any,
-  options: PiToolRoutingOptions,
-): { block: true; reason: string } | undefined {
-  if (!options.contextModeAvailable) return undefined;
-  const toolName = String(event?.toolName ?? event?.tool_name ?? "").toLowerCase();
-  const input = (event?.input ?? event?.params ?? {}) as Record<string, unknown>;
-  const cwd = options.cwd ?? process.cwd();
-
-  if ((toolName === "grep" || toolName === "find") && shouldRoutePiSearch(input)) {
-    return { block: true, reason: ROUTING_REASON };
-  }
-  if (toolName === "ls" && shouldRoutePiLs(input, cwd)) {
-    return { block: true, reason: ROUTING_REASON };
-  }
-  if (toolName === "bash") {
-    const command = String(input.command ?? "");
-    if (command && shouldRoutePiBash(command)) {
-      return { block: true, reason: ROUTING_REASON };
-    }
-  }
-  return undefined;
-}
 
 /**
  * Strip heredoc + single-quoted + double-quoted content from a shell command
@@ -601,17 +475,11 @@ export default function piExtension(pi: any): void {
     }
   });
 
-  // ── 2. tool_call — PreToolUse routing enforcement ──────
-  // Block bash commands that contain curl/wget/fetch/requests patterns.
+  // ── 2. tool_call — Raw HTTP output protection ──────────
+  // Block bash commands that would stream HTTP response bodies into context.
 
-  pi.on("tool_call", (event: any, ctx: any) => {
+  pi.on("tool_call", (event: any) => {
     try {
-      const routed = routePiToolCall(event, {
-        contextModeAvailable: contextModeToolsAvailable,
-        cwd: ctx?.cwd ?? projectDir,
-      });
-      if (routed) return routed;
-
       const toolName = String(event?.toolName ?? "").toLowerCase();
       if (toolName !== "bash") return;
 
@@ -780,17 +648,22 @@ export default function piExtension(pi: any): void {
       const parts: string[] = [];
       if (existingPrompt) parts.push(existingPrompt);
 
-      // Pi-1: Lightweight routing anchor — 7KB routing block is too heavy
-      // for Pi's context budget. Tool descriptions from pi.registerTool()
-      // already tell the model what each tool does. This anchor gives the
-      // deliberate choice (which tool for which scenario) without the full
-      // block/redirect/memory/tool-selection hierarchy.
-      parts.push(
-        "context-mode active. Hierarchy: ctx_batch_execute > ctx_execute > ctx_execute_file > ctx_search. " +
-        "Multi-command research → ctx_batch_execute. " +
-        "Web pages → ctx_fetch_and_index then ctx_search. Index docs → ctx_index. " +
-        "Stats → ctx_stats. Doctor → ctx_doctor. Upgrade → ctx_upgrade. Purge → ctx_purge."
-      );
+      // Pi-1: Keep exact coding operations on Pi's bounded native tools while
+      // making context-mode the clear first choice for broad inspection work.
+      // This is guidance, not a pre-tool hard block: the model retains access
+      // to the precise native operation when repository context requires it.
+      if (contextModeToolsAvailable) {
+        parts.push(
+          "context-mode active. Hierarchy for broad work: " +
+          "ctx_batch_execute > ctx_execute > ctx_execute_file > ctx_search. " +
+          "Use Pi native read/edit/grep/find/ls/bash for exact files, instructions, edits, and small bounded checks. " +
+          "Prefer ctx_batch_execute or ctx_execute for repository-wide exploration, repeated searches, " +
+          "multi-file analysis, and commands expected to produce substantial output. " +
+          "Use ctx_execute_file when sandboxed processing of a known file is useful. " +
+          "Web pages → ctx_fetch_and_index then ctx_search. Index docs → ctx_index. " +
+          "Stats → ctx_stats. Doctor → ctx_doctor. Upgrade → ctx_upgrade. Purge → ctx_purge."
+        );
+      }
 
       // Pi-3 + Pi-4: Always build active_memory (not just post-compact),
       // capped at 500 tokens via buildAutoInjection. Falls back to inline

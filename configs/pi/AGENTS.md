@@ -1,7 +1,8 @@
 # context-mode is active
 
-The Pi extension registers `ctx_*` tools before the agent turn and redirects
-unbounded native inspection calls (`read`, `grep`, `find`, `ls`, and large
-read-only `bash` output) to those tools. Small, explicitly bounded native
-operations remain available. If the context-mode bridge is unavailable, the
-extension allows native tools through so the session is not stranded.
+Use Pi's native `read` / `edit` / `grep` / `find` / `ls` / `bash` tools for
+exact files, instructions, edits, and small bounded checks. Prefer
+`ctx_batch_execute` or `ctx_execute` for repository-wide exploration, repeated
+searches, multi-file analysis, and commands expected to produce substantial
+output. Use `ctx_execute_file` when sandboxed processing of a known file is
+useful.

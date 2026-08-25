@@ -22,10 +22,6 @@ import { mkdtempSync, readFileSync, rmSync, mkdirSync, writeFileSync } from "nod
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { SessionDB } from "../src/session/db.js";
-import {
-  routePiToolCall,
-  PI_INLINE_SEARCH_MAX_RESULTS,
-} from "../src/adapters/pi/extension.js";
 
 // ── Mock Pi API ──────────────────────────────────────────────
 
@@ -298,85 +294,33 @@ describe("Pi Extension", () => {
   });
 
   // ═══════════════════════════════════════════════════════════
-  // Slice 3: PreToolUse routing enforcement (tool_call)
+  // Slice 3: PreToolUse HTTP safeguards and native-tool availability
   // ═══════════════════════════════════════════════════════════
 
-  describe("Slice 3: PreToolUse routing enforcement", () => {
-    describe("context-mode routing for native inspection tools", () => {
-      it("never redirects native read, even for a large unbounded file", () => {
-        const largePath = join(tempDir, "large.ts");
-        writeFileSync(largePath, "x".repeat(128 * 1024));
-        const event = { toolName: "read", input: { path: largePath } };
+  describe("Slice 3: PreToolUse HTTP safeguards and native-tool availability", () => {
+    it.each([
+      ["read", { path: "/src/app.ts" }],
+      ["grep", { pattern: "TODO" }],
+      ["find", { pattern: "*.ts" }],
+      ["ls", { path: "." }],
+    ])("keeps native %s available for precise inspection", async (toolName, input) => {
+      await registerPiExtension(api);
+      expect(await api._trigger("tool_call", { toolName, input })).toBeUndefined();
+    });
 
-        expect(routePiToolCall(event, { contextModeAvailable: false, cwd: tempDir })).toBeUndefined();
-        expect(routePiToolCall(event, { contextModeAvailable: true, cwd: tempDir })).toBeUndefined();
-      });
-
-      it("allows a short read and an explicitly bounded read", () => {
-        const shortPath = join(tempDir, "short.ts");
-        writeFileSync(shortPath, "const value = 1;\n");
-
-        expect(routePiToolCall(
-          { toolName: "read", input: { path: shortPath } },
-          { contextModeAvailable: true, cwd: tempDir },
-        )).toBeUndefined();
-        expect(routePiToolCall(
-          { toolName: "read", input: { path: shortPath, limit: 20 } },
-          { contextModeAvailable: true, cwd: tempDir },
-        )).toBeUndefined();
-      });
-
-      it("redirects unbounded grep/find and allows bounded searches", () => {
-        expect(routePiToolCall(
-          { toolName: "grep", input: { pattern: "TODO" } },
-          { contextModeAvailable: true, cwd: tempDir },
-        )?.block).toBe(true);
-        expect(routePiToolCall(
-          { toolName: "find", input: { pattern: "*.ts" } },
-          { contextModeAvailable: true, cwd: tempDir },
-        )?.block).toBe(true);
-
-        expect(routePiToolCall(
-          { toolName: "grep", input: { pattern: "TODO", maxResults: PI_INLINE_SEARCH_MAX_RESULTS } },
-          { contextModeAvailable: true, cwd: tempDir },
-        )).toBeUndefined();
-      });
-
-      it("redirects large directory listings but keeps small listings native", () => {
-        const smallDir = join(tempDir, "small");
-        const largeDir = join(tempDir, "large");
-        mkdirSync(smallDir);
-        mkdirSync(largeDir);
-        for (let i = 0; i < 101; i++) writeFileSync(join(largeDir, `file-${i}.txt`), "x");
-
-        expect(routePiToolCall(
-          { toolName: "ls", input: { path: smallDir } },
-          { contextModeAvailable: true, cwd: tempDir },
-        )).toBeUndefined();
-        expect(routePiToolCall(
-          { toolName: "ls", input: { path: largeDir } },
-          { contextModeAvailable: true, cwd: tempDir },
-        )?.block).toBe(true);
-      });
-
-      it("redirects large read-only bash output while allowing compact status", () => {
-        expect(routePiToolCall(
-          { toolName: "bash", input: { command: "rg TODO ." } },
-          { contextModeAvailable: true, cwd: tempDir },
-        )?.block).toBe(true);
-        expect(routePiToolCall(
-          { toolName: "bash", input: { command: "cat package.json" } },
-          { contextModeAvailable: true, cwd: tempDir },
-        )?.block).toBe(true);
-        expect(routePiToolCall(
-          { toolName: "bash", input: { command: "git status --short" } },
-          { contextModeAvailable: true, cwd: tempDir },
-        )).toBeUndefined();
-        expect(routePiToolCall(
-          { toolName: "bash", input: { command: "sed -n '1,20p' package.json" } },
-          { contextModeAvailable: true, cwd: tempDir },
-        )).toBeUndefined();
-      });
+    it.each([
+      "cat package.json",
+      "head package.json",
+      "tail app.log",
+      "rg TODO . | head -20",
+      "git diff",
+      "git log -5 --oneline",
+    ])("keeps native bash inspection available: %s", async (command) => {
+      await registerPiExtension(api);
+      expect(await api._trigger("tool_call", {
+        toolName: "bash",
+        input: { command },
+      })).toBeUndefined();
     });
 
     it("blocks bash with curl", async () => {
@@ -1025,7 +969,7 @@ describe("Pi Extension", () => {
   // Slice 7: Pi-1 lightweight routing anchor injection
   // ═══════════════════════════════════════════════════════════
 
-  describe("Slice 7: Routing block injection", () => {
+  describe("Slice 7: Tool-selection guidance injection", () => {
     it("injects lightweight routing anchor via context hook on first before_agent_start", async () => {
       await registerPiExtension(api);
       await api._trigger("session_start", {}, {

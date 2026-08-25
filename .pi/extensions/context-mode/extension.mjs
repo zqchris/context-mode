@@ -1853,7 +1853,7 @@ var init_index = __esm({
 // src/adapters/pi/extension.ts
 init_db();
 import { createHash as createHash2 } from "node:crypto";
-import { existsSync as existsSync5, mkdirSync as mkdirSync4, readdirSync, statSync } from "node:fs";
+import { existsSync as existsSync5, mkdirSync as mkdirSync4 } from "node:fs";
 import { homedir as homedir3 } from "node:os";
 import { join as join5, resolve as resolve4, dirname as dirname3 } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -4752,91 +4752,6 @@ var BLOCKED_HTTP_PATTERNS = [
   /\burllib\.request/,
   /\bInvoke-WebRequest\b/
 ];
-var PI_INLINE_COMMAND_MAX_LINES = 200;
-var PI_INLINE_SEARCH_MAX_RESULTS = 100;
-var PI_INLINE_LS_MAX_ENTRIES = 100;
-var ROUTING_REASON = "Use context-mode for large inspection output: ctx_execute or ctx_batch_execute for repository searches and commands. Keep native calls bounded when the result is genuinely small.";
-function numericInput(input, ...keys) {
-  for (const key of keys) {
-    const value = input[key];
-    if (typeof value === "number" && Number.isFinite(value)) return value;
-    if (typeof value === "string" && value.trim() !== "") {
-      const parsed = Number(value);
-      if (Number.isFinite(parsed)) return parsed;
-    }
-  }
-  return void 0;
-}
-function toolPath(input) {
-  const value = input.path ?? input.file_path ?? input.filePath;
-  return typeof value === "string" && value.length > 0 ? value : void 0;
-}
-function resolvedToolPath(input, cwd) {
-  const path = toolPath(input);
-  return path ? resolve4(cwd, path) : void 0;
-}
-function directoryIsLarge(path) {
-  if (!path) return false;
-  try {
-    if (!statSync(path).isDirectory()) return false;
-    return readdirSync(path, { withFileTypes: true }).length > PI_INLINE_LS_MAX_ENTRIES;
-  } catch {
-    return false;
-  }
-}
-function shouldRoutePiSearch(input) {
-  const limit = numericInput(input, "limit", "maxResults", "max_results");
-  return limit === void 0 || limit <= 0 || limit > PI_INLINE_SEARCH_MAX_RESULTS;
-}
-function shouldRoutePiLs(input, cwd = process.cwd()) {
-  const depth = numericInput(input, "depth");
-  if (depth !== void 0 && depth > 1) return true;
-  return directoryIsLarge(resolvedToolPath(input, cwd) ?? cwd);
-}
-function hasSmallLineBound(command) {
-  const sedRange = command.match(/-n\s+['"]?\d+\s*,\s*(\d+)/i)?.[1];
-  const numeric = sedRange ?? command.match(/(?:-n|--lines(?:=|\s+)|-\s*)\s*['"]?(\d+)/i)?.[1];
-  return numeric !== void 0 && Number(numeric) <= PI_INLINE_COMMAND_MAX_LINES;
-}
-function shouldRoutePiBash(command) {
-  const originalSegments = command.split(/\s*(?:&&|\|\||;)\s*/);
-  const strippedSegments = originalSegments.map(stripQuotedContent);
-  return strippedSegments.some((segment, index) => {
-    const s = segment.trim();
-    const original = originalSegments[index]?.trim() ?? s;
-    if (!s) return false;
-    if (/\b(?:cat|rg|grep|find|tree)\b/i.test(s)) return true;
-    if (/\b(?:head|tail|sed)\b/i.test(s) && !hasSmallLineBound(original)) return true;
-    if (/\bgit\s+diff\b/i.test(s)) {
-      return !/\s(?:--stat|--shortstat|--numstat|--name-only|--name-status)\b/i.test(s);
-    }
-    if (/\bgit\s+(?:show|log)\b/i.test(s)) {
-      const boundedCommitList = /\b(?:-1|--max-count(?:=|\s+)\d+|-n\s*\d+)\b/i.test(s);
-      const summaryOnly = /\s(?:--stat|--shortstat|--name-only|--name-status|--oneline)\b/i.test(s);
-      return !(boundedCommitList && summaryOnly);
-    }
-    return false;
-  });
-}
-function routePiToolCall(event, options) {
-  if (!options.contextModeAvailable) return void 0;
-  const toolName = String(event?.toolName ?? event?.tool_name ?? "").toLowerCase();
-  const input = event?.input ?? event?.params ?? {};
-  const cwd = options.cwd ?? process.cwd();
-  if ((toolName === "grep" || toolName === "find") && shouldRoutePiSearch(input)) {
-    return { block: true, reason: ROUTING_REASON };
-  }
-  if (toolName === "ls" && shouldRoutePiLs(input, cwd)) {
-    return { block: true, reason: ROUTING_REASON };
-  }
-  if (toolName === "bash") {
-    const command = String(input.command ?? "");
-    if (command && shouldRoutePiBash(command)) {
-      return { block: true, reason: ROUTING_REASON };
-    }
-  }
-  return void 0;
-}
 function stripQuotedContent(cmd) {
   return cmd.replace(/<<-?\s*["']?(\w+)["']?[\s\S]*?\n\s*\1/g, "").replace(/'[^']*'/g, "''").replace(/"[^"]*"/g, '""');
 }
@@ -5043,13 +4958,8 @@ function piExtension(pi) {
       }
     }
   });
-  pi.on("tool_call", (event, ctx) => {
+  pi.on("tool_call", (event) => {
     try {
-      const routed = routePiToolCall(event, {
-        contextModeAvailable: contextModeToolsAvailable,
-        cwd: ctx?.cwd ?? projectDir
-      });
-      if (routed) return routed;
       const toolName = String(event?.toolName ?? "").toLowerCase();
       if (toolName !== "bash") return;
       const command = String(event?.input?.command ?? "");
@@ -5136,9 +5046,11 @@ function piExtension(pi) {
       const existingPrompt = String(event?.systemPrompt ?? "");
       const parts = [];
       if (existingPrompt) parts.push(existingPrompt);
-      parts.push(
-        "context-mode active. Hierarchy: ctx_batch_execute > ctx_execute > ctx_execute_file > ctx_search. Multi-command research \u2192 ctx_batch_execute. Web pages \u2192 ctx_fetch_and_index then ctx_search. Index docs \u2192 ctx_index. Stats \u2192 ctx_stats. Doctor \u2192 ctx_doctor. Upgrade \u2192 ctx_upgrade. Purge \u2192 ctx_purge."
-      );
+      if (contextModeToolsAvailable) {
+        parts.push(
+          "context-mode active. Hierarchy for broad work: ctx_batch_execute > ctx_execute > ctx_execute_file > ctx_search. Use Pi native read/edit/grep/find/ls/bash for exact files, instructions, edits, and small bounded checks. Prefer ctx_batch_execute or ctx_execute for repository-wide exploration, repeated searches, multi-file analysis, and commands expected to produce substantial output. Use ctx_execute_file when sandboxed processing of a known file is useful. Web pages \u2192 ctx_fetch_and_index then ctx_search. Index docs \u2192 ctx_index. Stats \u2192 ctx_stats. Doctor \u2192 ctx_doctor. Upgrade \u2192 ctx_upgrade. Purge \u2192 ctx_purge."
+        );
+      }
       const activeEvents = db.getEvents(_sessionId, {
         minPriority: 3,
         limit: 50
@@ -5327,16 +5239,9 @@ function piExtension(pi) {
   _mcpBridgeReady = Promise.resolve();
 }
 export {
-  PI_INLINE_COMMAND_MAX_LINES,
-  PI_INLINE_LS_MAX_ENTRIES,
-  PI_INLINE_SEARCH_MAX_RESULTS,
   _mcpBridgeReady,
   piExtension as default,
   isSafeCurlWget,
   resolvePiWorkspaceDir,
-  routePiToolCall,
-  shouldRoutePiBash,
-  shouldRoutePiLs,
-  shouldRoutePiSearch,
   stripQuotedContent
 };
