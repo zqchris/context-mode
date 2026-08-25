@@ -64,19 +64,18 @@ const BLOCKED_HTTP_PATTERNS: RegExp[] = [
   /\bInvoke-WebRequest\b/,
 ];
 
-// Native Pi tools are useful for small, precise operations. They become a
-// context leak when they return an unbounded file/search/tree result. Keep the
-// thresholds deliberately conservative: the goal is to redirect large work,
-// not to disable normal coding operations such as reading a short file or
-// listing a small directory.
-export const PI_INLINE_READ_MAX_BYTES = 32 * 1024;
-export const PI_INLINE_READ_MAX_LINES = 200;
+// Native Pi `read` always remains available because the extension cannot know
+// whether a file is required verbatim (for example, instructions or source to
+// edit). Routing is limited to operations whose large-output shape can be
+// identified before execution: unbounded searches, directory trees, and shell
+// commands that are likely to dump substantial output.
+export const PI_INLINE_COMMAND_MAX_LINES = 200;
 export const PI_INLINE_SEARCH_MAX_RESULTS = 100;
 export const PI_INLINE_LS_MAX_ENTRIES = 100;
 
 const ROUTING_REASON =
   "Use context-mode for large inspection output: " +
-  "ctx_execute_file for file reads, ctx_execute or ctx_batch_execute for repository searches and commands. " +
+  "ctx_execute or ctx_batch_execute for repository searches and commands. " +
   "Keep native calls bounded when the result is genuinely small.";
 
 function numericInput(input: Record<string, unknown>, ...keys: string[]): number | undefined {
@@ -101,18 +100,6 @@ function resolvedToolPath(input: Record<string, unknown>, cwd: string): string |
   return path ? resolve(cwd, path) : undefined;
 }
 
-function fileIsLarge(path: string | undefined): boolean {
-  if (!path) return false;
-  try {
-    const stat = statSync(path);
-    return stat.isFile() && stat.size > PI_INLINE_READ_MAX_BYTES;
-  } catch {
-    // Let the native tool report missing/inaccessible paths. Routing should
-    // never turn a useful file-not-found diagnostic into a dead end.
-    return false;
-  }
-}
-
 function directoryIsLarge(path: string | undefined): boolean {
   if (!path) return false;
   try {
@@ -121,16 +108,6 @@ function directoryIsLarge(path: string | undefined): boolean {
   } catch {
     return false;
   }
-}
-
-/** True when a native `read` call is likely to put a large file in context. */
-export function shouldRoutePiRead(
-  input: Record<string, unknown>,
-  cwd = process.cwd(),
-): boolean {
-  const limit = numericInput(input, "limit", "maxLines");
-  if (limit !== undefined && limit > 0 && limit <= PI_INLINE_READ_MAX_LINES) return false;
-  return fileIsLarge(resolvedToolPath(input, cwd));
 }
 
 /** True when a native grep/find call has no useful output bound. */
@@ -152,7 +129,7 @@ export function shouldRoutePiLs(
 function hasSmallLineBound(command: string): boolean {
   const sedRange = command.match(/-n\s+['"]?\d+\s*,\s*(\d+)/i)?.[1];
   const numeric = sedRange ?? command.match(/(?:-n|--lines(?:=|\s+)|-\s*)\s*['"]?(\d+)/i)?.[1];
-  return numeric !== undefined && Number(numeric) <= PI_INLINE_READ_MAX_LINES;
+  return numeric !== undefined && Number(numeric) <= PI_INLINE_COMMAND_MAX_LINES;
 }
 
 /** True when a bash command is a likely unbounded repository/file dump. */
@@ -198,9 +175,6 @@ export function routePiToolCall(
   const input = (event?.input ?? event?.params ?? {}) as Record<string, unknown>;
   const cwd = options.cwd ?? process.cwd();
 
-  if (toolName === "read" && shouldRoutePiRead(input, cwd)) {
-    return { block: true, reason: ROUTING_REASON };
-  }
   if ((toolName === "grep" || toolName === "find") && shouldRoutePiSearch(input)) {
     return { block: true, reason: ROUTING_REASON };
   }
@@ -813,7 +787,7 @@ export default function piExtension(pi: any): void {
       // block/redirect/memory/tool-selection hierarchy.
       parts.push(
         "context-mode active. Hierarchy: ctx_batch_execute > ctx_execute > ctx_execute_file > ctx_search. " +
-        "Read/edit files → ctx_execute_file. Multi-command research → ctx_batch_execute. " +
+        "Multi-command research → ctx_batch_execute. " +
         "Web pages → ctx_fetch_and_index then ctx_search. Index docs → ctx_index. " +
         "Stats → ctx_stats. Doctor → ctx_doctor. Upgrade → ctx_upgrade. Purge → ctx_purge."
       );

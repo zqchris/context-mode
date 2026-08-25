@@ -4752,11 +4752,10 @@ var BLOCKED_HTTP_PATTERNS = [
   /\burllib\.request/,
   /\bInvoke-WebRequest\b/
 ];
-var PI_INLINE_READ_MAX_BYTES = 32 * 1024;
-var PI_INLINE_READ_MAX_LINES = 200;
+var PI_INLINE_COMMAND_MAX_LINES = 200;
 var PI_INLINE_SEARCH_MAX_RESULTS = 100;
 var PI_INLINE_LS_MAX_ENTRIES = 100;
-var ROUTING_REASON = "Use context-mode for large inspection output: ctx_execute_file for file reads, ctx_execute or ctx_batch_execute for repository searches and commands. Keep native calls bounded when the result is genuinely small.";
+var ROUTING_REASON = "Use context-mode for large inspection output: ctx_execute or ctx_batch_execute for repository searches and commands. Keep native calls bounded when the result is genuinely small.";
 function numericInput(input, ...keys) {
   for (const key of keys) {
     const value = input[key];
@@ -4776,15 +4775,6 @@ function resolvedToolPath(input, cwd) {
   const path = toolPath(input);
   return path ? resolve4(cwd, path) : void 0;
 }
-function fileIsLarge(path) {
-  if (!path) return false;
-  try {
-    const stat = statSync(path);
-    return stat.isFile() && stat.size > PI_INLINE_READ_MAX_BYTES;
-  } catch {
-    return false;
-  }
-}
 function directoryIsLarge(path) {
   if (!path) return false;
   try {
@@ -4793,11 +4783,6 @@ function directoryIsLarge(path) {
   } catch {
     return false;
   }
-}
-function shouldRoutePiRead(input, cwd = process.cwd()) {
-  const limit = numericInput(input, "limit", "maxLines");
-  if (limit !== void 0 && limit > 0 && limit <= PI_INLINE_READ_MAX_LINES) return false;
-  return fileIsLarge(resolvedToolPath(input, cwd));
 }
 function shouldRoutePiSearch(input) {
   const limit = numericInput(input, "limit", "maxResults", "max_results");
@@ -4811,7 +4796,7 @@ function shouldRoutePiLs(input, cwd = process.cwd()) {
 function hasSmallLineBound(command) {
   const sedRange = command.match(/-n\s+['"]?\d+\s*,\s*(\d+)/i)?.[1];
   const numeric = sedRange ?? command.match(/(?:-n|--lines(?:=|\s+)|-\s*)\s*['"]?(\d+)/i)?.[1];
-  return numeric !== void 0 && Number(numeric) <= PI_INLINE_READ_MAX_LINES;
+  return numeric !== void 0 && Number(numeric) <= PI_INLINE_COMMAND_MAX_LINES;
 }
 function shouldRoutePiBash(command) {
   const originalSegments = command.split(/\s*(?:&&|\|\||;)\s*/);
@@ -4838,9 +4823,6 @@ function routePiToolCall(event, options) {
   const toolName = String(event?.toolName ?? event?.tool_name ?? "").toLowerCase();
   const input = event?.input ?? event?.params ?? {};
   const cwd = options.cwd ?? process.cwd();
-  if (toolName === "read" && shouldRoutePiRead(input, cwd)) {
-    return { block: true, reason: ROUTING_REASON };
-  }
   if ((toolName === "grep" || toolName === "find") && shouldRoutePiSearch(input)) {
     return { block: true, reason: ROUTING_REASON };
   }
@@ -5155,7 +5137,7 @@ function piExtension(pi) {
       const parts = [];
       if (existingPrompt) parts.push(existingPrompt);
       parts.push(
-        "context-mode active. Hierarchy: ctx_batch_execute > ctx_execute > ctx_execute_file > ctx_search. Read/edit files \u2192 ctx_execute_file. Multi-command research \u2192 ctx_batch_execute. Web pages \u2192 ctx_fetch_and_index then ctx_search. Index docs \u2192 ctx_index. Stats \u2192 ctx_stats. Doctor \u2192 ctx_doctor. Upgrade \u2192 ctx_upgrade. Purge \u2192 ctx_purge."
+        "context-mode active. Hierarchy: ctx_batch_execute > ctx_execute > ctx_execute_file > ctx_search. Multi-command research \u2192 ctx_batch_execute. Web pages \u2192 ctx_fetch_and_index then ctx_search. Index docs \u2192 ctx_index. Stats \u2192 ctx_stats. Doctor \u2192 ctx_doctor. Upgrade \u2192 ctx_upgrade. Purge \u2192 ctx_purge."
       );
       const activeEvents = db.getEvents(_sessionId, {
         minPriority: 3,
@@ -5345,9 +5327,8 @@ function piExtension(pi) {
   _mcpBridgeReady = Promise.resolve();
 }
 export {
+  PI_INLINE_COMMAND_MAX_LINES,
   PI_INLINE_LS_MAX_ENTRIES,
-  PI_INLINE_READ_MAX_BYTES,
-  PI_INLINE_READ_MAX_LINES,
   PI_INLINE_SEARCH_MAX_RESULTS,
   _mcpBridgeReady,
   piExtension as default,
@@ -5356,7 +5337,6 @@ export {
   routePiToolCall,
   shouldRoutePiBash,
   shouldRoutePiLs,
-  shouldRoutePiRead,
   shouldRoutePiSearch,
   stripQuotedContent
 };

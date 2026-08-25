@@ -24,7 +24,6 @@ import { tmpdir } from "node:os";
 import { SessionDB } from "../src/session/db.js";
 import {
   routePiToolCall,
-  PI_INLINE_READ_MAX_BYTES,
   PI_INLINE_SEARCH_MAX_RESULTS,
 } from "../src/adapters/pi/extension.js";
 
@@ -304,13 +303,13 @@ describe("Pi Extension", () => {
 
   describe("Slice 3: PreToolUse routing enforcement", () => {
     describe("context-mode routing for native inspection tools", () => {
-      it("blocks an unbounded large read only when ctx_* tools are available", () => {
+      it("never redirects native read, even for a large unbounded file", () => {
         const largePath = join(tempDir, "large.ts");
-        writeFileSync(largePath, "x".repeat(PI_INLINE_READ_MAX_BYTES + 1));
+        writeFileSync(largePath, "x".repeat(128 * 1024));
         const event = { toolName: "read", input: { path: largePath } };
 
         expect(routePiToolCall(event, { contextModeAvailable: false, cwd: tempDir })).toBeUndefined();
-        expect(routePiToolCall(event, { contextModeAvailable: true, cwd: tempDir })?.block).toBe(true);
+        expect(routePiToolCall(event, { contextModeAvailable: true, cwd: tempDir })).toBeUndefined();
       });
 
       it("allows a short read and an explicitly bounded read", () => {
