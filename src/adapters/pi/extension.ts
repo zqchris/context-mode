@@ -12,7 +12,7 @@
  */
 
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve, dirname } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -63,6 +63,158 @@ const BLOCKED_HTTP_PATTERNS: RegExp[] = [
   /\burllib\.request/,
   /\bInvoke-WebRequest\b/,
 ];
+
+// Native Pi tools are useful for small, precise operations. They become a
+// context leak when they return an unbounded file/search/tree result. Keep the
+// thresholds deliberately conservative: the goal is to redirect large work,
+// not to disable normal coding operations such as reading a short file or
+// listing a small directory.
+export const PI_INLINE_READ_MAX_BYTES = 32 * 1024;
+export const PI_INLINE_READ_MAX_LINES = 200;
+export const PI_INLINE_SEARCH_MAX_RESULTS = 100;
+export const PI_INLINE_LS_MAX_ENTRIES = 100;
+
+const ROUTING_REASON =
+  "Use context-mode for large inspection output: " +
+  "ctx_execute_file for file reads, ctx_execute or ctx_batch_execute for repository searches and commands. " +
+  "Keep native calls bounded when the result is genuinely small.";
+
+function numericInput(input: Record<string, unknown>, ...keys: string[]): number | undefined {
+  for (const key of keys) {
+    const value = input[key];
+    if (typeof value === "number" && Number.isFinite(value)) return value;
+    if (typeof value === "string" && value.trim() !== "") {
+      const parsed = Number(value);
+      if (Number.isFinite(parsed)) return parsed;
+    }
+  }
+  return undefined;
+}
+
+function toolPath(input: Record<string, unknown>): string | undefined {
+  const value = input.path ?? input.file_path ?? input.filePath;
+  return typeof value === "string" && value.length > 0 ? value : undefined;
+}
+
+function resolvedToolPath(input: Record<string, unknown>, cwd: string): string | undefined {
+  const path = toolPath(input);
+  return path ? resolve(cwd, path) : undefined;
+}
+
+function fileIsLarge(path: string | undefined): boolean {
+  if (!path) return false;
+  try {
+    const stat = statSync(path);
+    return stat.isFile() && stat.size > PI_INLINE_READ_MAX_BYTES;
+  } catch {
+    // Let the native tool report missing/inaccessible paths. Routing should
+    // never turn a useful file-not-found diagnostic into a dead end.
+    return false;
+  }
+}
+
+function directoryIsLarge(path: string | undefined): boolean {
+  if (!path) return false;
+  try {
+    if (!statSync(path).isDirectory()) return false;
+    return readdirSync(path, { withFileTypes: true }).length > PI_INLINE_LS_MAX_ENTRIES;
+  } catch {
+    return false;
+  }
+}
+
+/** True when a native `read` call is likely to put a large file in context. */
+export function shouldRoutePiRead(
+  input: Record<string, unknown>,
+  cwd = process.cwd(),
+): boolean {
+  const limit = numericInput(input, "limit", "maxLines");
+  if (limit !== undefined && limit > 0 && limit <= PI_INLINE_READ_MAX_LINES) return false;
+  return fileIsLarge(resolvedToolPath(input, cwd));
+}
+
+/** True when a native grep/find call has no useful output bound. */
+export function shouldRoutePiSearch(input: Record<string, unknown>): boolean {
+  const limit = numericInput(input, "limit", "maxResults", "max_results");
+  return limit === undefined || limit <= 0 || limit > PI_INLINE_SEARCH_MAX_RESULTS;
+}
+
+/** True when a native `ls` call can enumerate a large tree/directory. */
+export function shouldRoutePiLs(
+  input: Record<string, unknown>,
+  cwd = process.cwd(),
+): boolean {
+  const depth = numericInput(input, "depth");
+  if (depth !== undefined && depth > 1) return true;
+  return directoryIsLarge(resolvedToolPath(input, cwd) ?? cwd);
+}
+
+function hasSmallLineBound(command: string): boolean {
+  const sedRange = command.match(/-n\s+['"]?\d+\s*,\s*(\d+)/i)?.[1];
+  const numeric = sedRange ?? command.match(/(?:-n|--lines(?:=|\s+)|-\s*)\s*['"]?(\d+)/i)?.[1];
+  return numeric !== undefined && Number(numeric) <= PI_INLINE_READ_MAX_LINES;
+}
+
+/** True when a bash command is a likely unbounded repository/file dump. */
+export function shouldRoutePiBash(command: string): boolean {
+  const originalSegments = command.split(/\s*(?:&&|\|\||;)\s*/);
+  const strippedSegments = originalSegments.map(stripQuotedContent);
+  return strippedSegments.some((segment, index) => {
+    const s = segment.trim();
+    const original = originalSegments[index]?.trim() ?? s;
+    if (!s) return false;
+
+    if (/\b(?:cat|rg|grep|find|tree)\b/i.test(s)) return true;
+    if (/\b(?:head|tail|sed)\b/i.test(s) && !hasSmallLineBound(original)) return true;
+
+    if (/\bgit\s+diff\b/i.test(s)) {
+      return !/\s(?:--stat|--shortstat|--numstat|--name-only|--name-status)\b/i.test(s);
+    }
+    if (/\bgit\s+(?:show|log)\b/i.test(s)) {
+      const boundedCommitList = /\b(?:-1|--max-count(?:=|\s+)\d+|-n\s*\d+)\b/i.test(s);
+      const summaryOnly = /\s(?:--stat|--shortstat|--name-only|--name-status|--oneline)\b/i.test(s);
+      return !(boundedCommitList && summaryOnly);
+    }
+    return false;
+  });
+}
+
+export interface PiToolRoutingOptions {
+  contextModeAvailable: boolean;
+  cwd?: string;
+}
+
+/**
+ * Decide whether a Pi native tool call should be redirected to context-mode.
+ * This is intentionally pure apart from bounded filesystem metadata checks so
+ * it can be tested without starting Pi or the MCP bridge.
+ */
+export function routePiToolCall(
+  event: any,
+  options: PiToolRoutingOptions,
+): { block: true; reason: string } | undefined {
+  if (!options.contextModeAvailable) return undefined;
+  const toolName = String(event?.toolName ?? event?.tool_name ?? "").toLowerCase();
+  const input = (event?.input ?? event?.params ?? {}) as Record<string, unknown>;
+  const cwd = options.cwd ?? process.cwd();
+
+  if (toolName === "read" && shouldRoutePiRead(input, cwd)) {
+    return { block: true, reason: ROUTING_REASON };
+  }
+  if ((toolName === "grep" || toolName === "find") && shouldRoutePiSearch(input)) {
+    return { block: true, reason: ROUTING_REASON };
+  }
+  if (toolName === "ls" && shouldRoutePiLs(input, cwd)) {
+    return { block: true, reason: ROUTING_REASON };
+  }
+  if (toolName === "bash") {
+    const command = String(input.command ?? "");
+    if (command && shouldRoutePiBash(command)) {
+      return { block: true, reason: ROUTING_REASON };
+    }
+  }
+  return undefined;
+}
 
 /**
  * Strip heredoc + single-quoted + double-quoted content from a shell command
@@ -432,15 +584,27 @@ export default function piExtension(pi: any): void {
   const serverBundle = resolve(pluginRoot, "server.bundle.mjs");
   let mcpBridgeStarted = false;
   let mcpBridgeGeneration = 0;
+  let contextModeToolsAvailable = false;
   const ensureMCPBridge = (foreground: boolean): Promise<void> => {
     if (mcpBridgeStarted) return _mcpBridgeReady;
     mcpBridgeStarted = true;
+    contextModeToolsAvailable = false;
     const generation = ++mcpBridgeGeneration;
-    return startPiMCPBridge(
+    const ready = startPiMCPBridge(
       pi,
       serverBundle,
       () => mcpBridgeStarted && mcpBridgeGeneration === generation,
       foreground,
+    );
+    return ready.then(
+      () => {
+        contextModeToolsAvailable = Boolean(
+          _mcpBridge?.tools.some((name) => name.startsWith("ctx_")),
+        );
+      },
+      () => {
+        contextModeToolsAvailable = false;
+      },
     );
   };
   // Issue #545 — Pi workspace resolver. PI_CONFIG_DIR is Pi's CONFIG dir
@@ -480,8 +644,14 @@ export default function piExtension(pi: any): void {
   // ── 2. tool_call — PreToolUse routing enforcement ──────
   // Block bash commands that contain curl/wget/fetch/requests patterns.
 
-  pi.on("tool_call", (event: any) => {
+  pi.on("tool_call", (event: any, ctx: any) => {
     try {
+      const routed = routePiToolCall(event, {
+        contextModeAvailable: contextModeToolsAvailable,
+        cwd: ctx?.cwd ?? projectDir,
+      });
+      if (routed) return routed;
+
       const toolName = String(event?.toolName ?? "").toLowerCase();
       if (toolName !== "bash") return;
 
@@ -873,6 +1043,7 @@ export default function piExtension(pi: any): void {
     // a stale child handle after session shutdown.
     mcpBridgeGeneration++;
     mcpBridgeStarted = false;
+    contextModeToolsAvailable = false;
     try {
       await Promise.race([
         _mcpBridgeReady,

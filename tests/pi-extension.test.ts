@@ -18,10 +18,15 @@ import "./setup-home";
 
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { createHash } from "node:crypto";
-import { mkdtempSync, rmSync, mkdirSync } from "node:fs";
+import { mkdtempSync, rmSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { SessionDB } from "../src/session/db.js";
+import {
+  routePiToolCall,
+  PI_INLINE_READ_MAX_BYTES,
+  PI_INLINE_SEARCH_MAX_RESULTS,
+} from "../src/adapters/pi/extension.js";
 
 // ── Mock Pi API ──────────────────────────────────────────────
 
@@ -267,6 +272,83 @@ describe("Pi Extension", () => {
   // ═══════════════════════════════════════════════════════════
 
   describe("Slice 3: PreToolUse routing enforcement", () => {
+    describe("context-mode routing for native inspection tools", () => {
+      it("blocks an unbounded large read only when ctx_* tools are available", () => {
+        const largePath = join(tempDir, "large.ts");
+        writeFileSync(largePath, "x".repeat(PI_INLINE_READ_MAX_BYTES + 1));
+        const event = { toolName: "read", input: { path: largePath } };
+
+        expect(routePiToolCall(event, { contextModeAvailable: false, cwd: tempDir })).toBeUndefined();
+        expect(routePiToolCall(event, { contextModeAvailable: true, cwd: tempDir })?.block).toBe(true);
+      });
+
+      it("allows a short read and an explicitly bounded read", () => {
+        const shortPath = join(tempDir, "short.ts");
+        writeFileSync(shortPath, "const value = 1;\n");
+
+        expect(routePiToolCall(
+          { toolName: "read", input: { path: shortPath } },
+          { contextModeAvailable: true, cwd: tempDir },
+        )).toBeUndefined();
+        expect(routePiToolCall(
+          { toolName: "read", input: { path: shortPath, limit: 20 } },
+          { contextModeAvailable: true, cwd: tempDir },
+        )).toBeUndefined();
+      });
+
+      it("redirects unbounded grep/find and allows bounded searches", () => {
+        expect(routePiToolCall(
+          { toolName: "grep", input: { pattern: "TODO" } },
+          { contextModeAvailable: true, cwd: tempDir },
+        )?.block).toBe(true);
+        expect(routePiToolCall(
+          { toolName: "find", input: { pattern: "*.ts" } },
+          { contextModeAvailable: true, cwd: tempDir },
+        )?.block).toBe(true);
+
+        expect(routePiToolCall(
+          { toolName: "grep", input: { pattern: "TODO", maxResults: PI_INLINE_SEARCH_MAX_RESULTS } },
+          { contextModeAvailable: true, cwd: tempDir },
+        )).toBeUndefined();
+      });
+
+      it("redirects large directory listings but keeps small listings native", () => {
+        const smallDir = join(tempDir, "small");
+        const largeDir = join(tempDir, "large");
+        mkdirSync(smallDir);
+        mkdirSync(largeDir);
+        for (let i = 0; i < 101; i++) writeFileSync(join(largeDir, `file-${i}.txt`), "x");
+
+        expect(routePiToolCall(
+          { toolName: "ls", input: { path: smallDir } },
+          { contextModeAvailable: true, cwd: tempDir },
+        )).toBeUndefined();
+        expect(routePiToolCall(
+          { toolName: "ls", input: { path: largeDir } },
+          { contextModeAvailable: true, cwd: tempDir },
+        )?.block).toBe(true);
+      });
+
+      it("redirects large read-only bash output while allowing compact status", () => {
+        expect(routePiToolCall(
+          { toolName: "bash", input: { command: "rg TODO ." } },
+          { contextModeAvailable: true, cwd: tempDir },
+        )?.block).toBe(true);
+        expect(routePiToolCall(
+          { toolName: "bash", input: { command: "cat package.json" } },
+          { contextModeAvailable: true, cwd: tempDir },
+        )?.block).toBe(true);
+        expect(routePiToolCall(
+          { toolName: "bash", input: { command: "git status --short" } },
+          { contextModeAvailable: true, cwd: tempDir },
+        )).toBeUndefined();
+        expect(routePiToolCall(
+          { toolName: "bash", input: { command: "sed -n '1,20p' package.json" } },
+          { contextModeAvailable: true, cwd: tempDir },
+        )).toBeUndefined();
+      });
+    });
+
     it("blocks bash with curl", async () => {
       await registerPiExtension(api);
 
