@@ -18,8 +18,8 @@ import "./setup-home";
 
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { createHash } from "node:crypto";
-import { mkdtempSync, rmSync, mkdirSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { mkdtempSync, readFileSync, rmSync, mkdirSync, writeFileSync } from "node:fs";
+import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { SessionDB } from "../src/session/db.js";
 import {
@@ -71,6 +71,18 @@ function createMockPiApi() {
 
 let tempDir: string;
 let api: ReturnType<typeof createMockPiApi>;
+
+describe("Pi package manifest", () => {
+  it("loads the extension without auto-discovering the bundled context-mode skill", () => {
+    const repoRoot = resolve(__dirname, "..");
+    const pkg = JSON.parse(readFileSync(join(repoRoot, "package.json"), "utf-8")) as {
+      pi?: { extensions?: unknown; skills?: unknown };
+    };
+
+    expect(pkg.pi?.extensions).toContain("./.pi/extensions/context-mode/extension.mjs");
+    expect(pkg.pi?.skills).toEqual([]);
+  });
+});
 
 // ── Dynamic import helper ───────────────────────────────────
 

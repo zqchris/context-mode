@@ -30,7 +30,8 @@
   "pi": {
     "extensions": [
       "./.pi/extensions/context-mode/extension.mjs"
-    ]
+    ],
+    "skills": []
   },
   "openclaw": {
     "extensions": [
