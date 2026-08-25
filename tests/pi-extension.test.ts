@@ -82,6 +82,25 @@ describe("Pi package manifest", () => {
     expect(pkg.pi?.extensions).toContain("./.pi/extensions/context-mode/extension.mjs");
     expect(pkg.pi?.skills).toEqual([]);
   });
+
+  it("does not declare install lifecycle scripts that Cindy must suppress", () => {
+    const repoRoot = resolve(__dirname, "..");
+    const pkg = JSON.parse(readFileSync(join(repoRoot, "package.json"), "utf-8")) as {
+      scripts?: Record<string, unknown>;
+    };
+    const installLifecycleScripts = [
+      "preinstall",
+      "install",
+      "postinstall",
+      "prepare",
+      "prepublish",
+      "prepublishOnly",
+    ];
+
+    for (const script of installLifecycleScripts) {
+      expect(pkg.scripts?.[script]).toBeUndefined();
+    }
+  });
 });
 
 // ── Dynamic import helper ───────────────────────────────────
