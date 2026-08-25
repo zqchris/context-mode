@@ -909,6 +909,19 @@ describe("Pi Extension", () => {
       expect(result).toBeDefined();
     });
 
+    it("returns command text without requiring Pi UI notify", async () => {
+      await registerPiExtension(api);
+      const notify = vi.fn();
+
+      const result = await api._getCommand("ctx-stats")!.handler!(
+        {},
+        { hasUI: true, ui: { notify } },
+      );
+
+      expect(result).toEqual(expect.objectContaining({ text: expect.any(String) }));
+      expect(notify).not.toHaveBeenCalled();
+    });
+
     it("/ctx-stats treats SQLite started_at as UTC", async () => {
       vi.useFakeTimers();
       vi.setSystemTime(new Date("2026-05-09T12:30:00Z"));
